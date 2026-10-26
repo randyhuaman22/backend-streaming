@@ -5,6 +5,7 @@ const cheerio = require("cheerio");
 const cors = require("cors");
 const NodeCache = require("node-cache");
 const puppeteer = require("puppeteer");
+const iptvParser = require("iptv-playlist-parser");
 
 const app = express();
 const PORT = 3000, HOST = "0.0.0.0", CACHE_TTL_SECONDS = 60;
@@ -14,11 +15,6 @@ const SPORTS_URLS = [
   "https://futbollibrelive.pe",
   "https://futbollibresgol.pe",
   "https://viperplay.rest"
-];
-
-const MOVIES_URLS = [
-  "https://cuevana3c.pro",
-  "https://pelisflix2.rent/nuevas-peliculas/"
 ];
 
 const USER_AGENTS = [
@@ -36,12 +32,16 @@ function validateSourceUrl(value) {
 }
 
 const http = axios.create({
-  timeout: 12000, maxRedirects: 3, responseType: "text",
-  headers: { "Accept-Language": "es-ES,es;q=0.9,en;q=0.7", Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" }
+  timeout: 15000, maxRedirects: 3, responseType: "text",
+  headers: { 
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.7", 
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" 
+  }
 });
 
 http.interceptors.request.use(config => {
-  const url = new URL(config.url, config.baseURL);
+  if (config.url.includes("iptv-org") || config.url.includes("themoviedb.org")) return config; 
+  const url = new URL(config.url, config.baseURL || "http://localhost");
   validateSourceUrl(url.href);
   config.headers["User-Agent"] = USER_AGENTS[0];
   config.headers.Referer = url.origin + "/";
@@ -55,7 +55,9 @@ function absoluteUrl(value, base) {
 
 function cleanText(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
 
-// 1. Scraper de Deportes (Puppeteer)
+// ==========================================
+// 1. MÓDULO DE DEPORTES
+// ==========================================
 async function scrapeMatches() {
   for (const sourceUrl of SPORTS_URLS) {
     let browser;
@@ -117,85 +119,6 @@ async function scrapeMatches() {
   return []; 
 }
 
-// 2. Extractor Dinámico para TODAS las categorías de Cuevana
-async function extractCatalog(targetUrl, logMessage) {
-  console.log(`\n--- ${logMessage}: ${targetUrl} ---`);
-  try {
-    const response = await http.get(targetUrl);
-    const { data: html, request: { res: { responseUrl: finalUrl } = {} } = {} } = response;
-    const $ = cheerio.load(String(html)), found = new Map();
-    
-    $("article, .movie-item, .film-item, .poster, .item").each((_, element) => {
-      const item = $(element), anchor = item.is("a") ? item : item.find("a[href]").first();
-      // Ajuste estético implementado aquí:
-      const title = cleanText(anchor.attr("title") || item.find("h2, h3, .title, .movie-title").first().text() || anchor.text()).replace(/^(\d{4})(?=[^\s])/g, '$1 ');
-      const url = absoluteUrl(anchor.attr("href"), finalUrl || targetUrl);
-      const image = item.find("img").first();
-      const poster = absoluteUrl(image.attr("data-src") || image.attr("data-lazy-src") || image.attr("src"), finalUrl || targetUrl);
-      
-      if (!title || !url) return;
-      found.set(url, { title, poster, url });
-    });
-
-    const results = [...found.values()];
-    console.log(`Resultados extraídos: ${results.length}`);
-    return results;
-  } catch (error) {
-    console.error(`Error en ${targetUrl}:`, error.message);
-    return [];
-  }
-}
-
-// Enrutador de Categorías
-async function scrapeCategory(path, logMessage) {
-  for (const sourceUrl of MOVIES_URLS) {
-    const base = validateSourceUrl(sourceUrl).href.replace(/\/$/, '');
-    const targetUrl = path ? `${base}/${path}` : base;
-    const results = await extractCatalog(targetUrl, logMessage);
-    if (results.length > 0) return results;
-  }
-  return [];
-}
-
-async function searchMovies(query) {
-  for (const sourceUrl of MOVIES_URLS) {
-    const base = validateSourceUrl(sourceUrl).href.replace(/\/$/, '');
-    const searchUrl = `${base}/?s=${encodeURIComponent(query)}`;
-    const results = await extractCatalog(searchUrl, `BUSCANDO "${query}" EN TODA LA BASE DE DATOS`);
-    if (results.length > 0) return results;
-  }
-  return [];
-}
-
-function findDirectHls(html) {
-  const matches = html.match(/https?:\/\/[^"'\s<>\\]+?\.m3u8(?:\?[^"'\s<>\\]*)?/gi) || [];
-  return matches.find(url => { try { validateSourceUrl(url); return true; } catch (_) { return false; } }) || null;
-}
-
-async function extractStream(startUrl) {
-  let current = validateSourceUrl(startUrl).href, firstIframe = null;
-  for (let depth = 0; depth <= 2; depth++) {
-    const response = await http.get(current);
-    const html = String(response.data);
-    const finalUrl = response.request?.res?.responseUrl || current;
-    
-    const hls = findDirectHls(html);
-    if (hls) return { streamUrl: hls, type: "hls" };
-    
-    const $ = cheerio.load(html);
-    const iframe = $("iframe[src]").toArray().map(node => absoluteUrl($(node).attr("src"), finalUrl)).find(candidate => {
-      if (!candidate) return false;
-      try { validateSourceUrl(candidate); return true; } catch (_) { return false; }
-    });
-    if (!iframe) break;
-    if (!firstIframe) firstIframe = iframe;
-    current = iframe;
-  }
-  return firstIframe ? { streamUrl: firstIframe, type: "iframe" } : null;
-}
-
-// --- ENDPOINTS PARA LA INTERFAZ DE LA SMART TV ---
-
 app.get("/api/matches", async (req, res) => {
   const cached = cache.get("matches");
   if (cached) return res.json({ success: true, matches: cached });
@@ -204,35 +127,90 @@ app.get("/api/matches", async (req, res) => {
   return res.json({ success: true, matches: data });
 });
 
-//Endpoints mapeados exactos al menú de Cuevana
+// ==========================================
+// 2. MÓDULO DE TELEVISIÓN PERUANA (.m3u8)
+// ==========================================
+app.get("/api/channels", async (req, res) => {
+  const cachedChannels = cache.get("pe_channels");
+  if (cachedChannels) return res.json({ success: true, channels: cachedChannels });
+
+  try {
+    console.log("\n--- OBTENIENDO CANALES DE TV PERUANA ---");
+    const response = await axios.get("https://iptv-org.github.io/iptv/countries/pe.m3u");
+    const playlist = iptvParser.parse(response.data);
+
+    const channels = playlist.items.map(item => ({
+      name: item.name,
+      logo: item.tvg.logo || null,
+      category: item.group.title || "General",
+      url: item.url
+    }));
+
+    cache.set("pe_channels", channels, 3600); 
+    return res.json({ success: true, count: channels.length, channels });
+  } catch (error) {
+    console.error("Error al cargar canales IPTV:", error.message);
+    return res.status(500).json({ success: false, error: "No se pudieron cargar los canales" });
+  }
+});
+
+// ==========================================
+// 3. MÓDULO DE PELÍCULAS (TMDB + Nube Directa)
+// ==========================================
+const TMDB_API_KEY = "d9214ee47e9097fdcb0732e6b0f338c9"; 
+const TMDB_BASE_URL = "https://api.themoviedb.org/3";
+
+// 3.1 Extraer Catálogo Visual de TMDB (En Español)
 app.get("/api/movies", async (req, res) => {
-  const data = await scrapeCategory("peliculas", "EXTRAYENDO PELÍCULAS");
-  return res.json({ success: true, data });
-});
-app.get("/api/movies/featured", async (req, res) => {
-  const data = await scrapeCategory("peliculas-destacadas", "EXTRAYENDO PELÍCULAS DESTACADAS");
-  return res.json({ success: true, data });
-});
-app.get("/api/series", async (req, res) => {
-  const data = await scrapeCategory("series", "EXTRAYENDO SERIES");
-  return res.json({ success: true, data });
-});
-app.get("/api/episodes", async (req, res) => {
-  const data = await scrapeCategory("episodios", "EXTRAYENDO EPISODIOS RECIENTES");
-  return res.json({ success: true, data });
-});
-
-app.get("/api/search", async (req, res) => {
-  if (!req.query.q) return res.status(400).json({ success: false, error: "Falta término de búsqueda" });
-  const data = await searchMovies(req.query.q);
-  return res.json({ success: true, data });
+  try {
+    const url = `${TMDB_BASE_URL}/movie/popular?api_key=${TMDB_API_KEY}&language=es-MX&page=1`;
+    const response = await axios.get(url);
+    const movies = response.data.results.map(movie => ({
+      id: movie.id,
+      title: movie.title,
+      overview: movie.overview,
+      year: movie.release_date ? movie.release_date.substring(0, 4) : "N/A",
+      poster: `https://image.tmdb.org/t/p/w500${movie.poster_path}`,
+      backdrop: `https://image.tmdb.org/t/p/w1280${movie.backdrop_path}`
+    }));
+    return res.json({ success: true, count: movies.length, movies });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: "Error TMDB" });
+  }
 });
 
-app.get("/api/stream", async (req, res) => {
-  if (!req.query.url) return res.status(400).json({ success: false, error: "Falta url" });
-  const result = await extractStream(req.query.url);
-  if (!result) return res.status(200).json({ success: false, error: "Video no válido" });
-  return res.json({ success: true, ...result });
+// 3.2 Obtener Stream Directo en la Nube (Multi-servidor sin bloqueos DNS)
+app.get("/api/stream/find/:tmdbId", async (req, res) => {
+  const tmdbId = req.params.tmdbId;
+
+  try {
+    const externalIdsUrl = `${TMDB_BASE_URL}/movie/${tmdbId}/external_ids?api_key=${TMDB_API_KEY}`;
+    const idsResponse = await axios.get(externalIdsUrl);
+    const imdbId = idsResponse.data.imdb_id;
+
+    console.log(`[Streaming] Generando opciones para TMDB: ${tmdbId} | IMDB: ${imdbId}`);
+
+    const servers = [
+      {
+        name: "Servidor Principal (VidLink)",
+        embed_url: `https://vidlink.pro/movie/${tmdbId}`
+      },
+      {
+        name: "Servidor Secundario (SmashyStream)",
+        embed_url: imdbId ? `https://embed.smashystream.com/playere.php?imdb=${imdbId}` : null
+      }
+    ].filter(s => s.embed_url !== null);
+
+    return res.json({
+      success: true,
+      tmdb_id: tmdbId,
+      servers: servers
+    });
+
+  } catch (error) {
+    console.error("Error al generar stream:", error.message);
+    return res.status(500).json({ success: false, error: "No se pudo generar el enlace de video" });
+  }
 });
 
 app.listen(PORT, HOST, () => console.log(`backend-streaming activo en http://${HOST}:${PORT}`));
